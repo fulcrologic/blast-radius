@@ -83,7 +83,7 @@
             sdeps (if home
                     (format "{:deps {io.github.fulcrologic/blast-radius {:local/root \"%s\"}}}" home)
                     ;; Public GitHub repo — resolved over HTTPS, no creds needed.
-                    "{:deps {io.github.fulcrologic/blast-radius {:git/sha \"REPLACE_WITH_PINNED_SHA\"}}}")]
+                    "{:deps {io.github.fulcrologic/blast-radius {:git/sha \"9c46246844b6fda97f35259d668156ae13ca23c8\"}}}")]
         (into ["clojure" "-Sdeps" sdeps "-M" "-m" "blast-radius.cli"] args)))))
 
 ;; exec replaces this bb process with the JVM, forwarding stdout/stderr and the exit code.

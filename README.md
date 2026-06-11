@@ -29,23 +29,18 @@ disclosed **trust-list** — never dropping a coupling for being "unlikely."
 
 ## Install
 
-Requires `bb`, `java`, native `clj-kondo`, `git`, and the `clojure` CLI (for the one-time engine
-build). Install the launcher with [bbin](https://github.com/babashka/bbin):
+Requires `bb`, `java`, `clj-kondo`, and `git`. Install the launcher with
+[bbin](https://github.com/babashka/bbin):
 
 ```bash
 bbin install https://raw.githubusercontent.com/fulcrologic/blast-radius/main/bin/blast-radius --as blast-radius
 ```
 
-On first run the launcher resolves the engine (a self-contained jar it builds + caches, or the
-public repo via the clojure CLI) — no extra setup. For the fastest java-only runtime, clone the
-repo and point `BLAST_RADIUS_HOME` at it:
-
-```bash
-git clone https://github.com/fulcrologic/blast-radius
-export BLAST_RADIUS_HOME="$(pwd)/blast-radius"      # first run builds + caches the engine jar
-```
-
-See [docs/USAGE.md](docs/USAGE.md) for the full install matrix (jar / release-asset / no-checkout).
+That's it — **no clone, no env vars, no config.** On first run the launcher downloads the engine
+(a self-contained JVM jar) from the GitHub Release and caches it; every run after is plain
+`java`. (If the release asset is ever unavailable it falls back to cloning + building from source,
+which additionally needs the `clojure` CLI.) See [docs/USAGE.md](docs/USAGE.md) for optional
+overrides.
 
 ## Usage
 

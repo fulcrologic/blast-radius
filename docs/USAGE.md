@@ -8,18 +8,10 @@ several-fold faster than sci.
 ## Requirements
 
 - `bb` (Babashka) — the launcher.
-- A **JVM** (`java`) — the engine (runs the bundled uberjar; **no clojure CLI needed**).
-- `clj-kondo` native binary on PATH — the analysis engine (≈4× faster cold than the JVM library).
+- `java` (a JVM) — runs the engine jar.
+- `clj-kondo` native binary on PATH — the analysis engine.
 - `git` — change detection + read-only tree materialization.
-- `clojure` CLI — *optional*, only for the dev / git-coordinate fallback engine paths.
-
-## Build the engine jar
-
-```bash
-clojure -T:build uber        # -> target/blast-radius.jar (self-contained, ~10MB)
-```
-
-The jar runs standalone: `java -cp target/blast-radius.jar clojure.main -m blast-radius.cli …`.
+- `clojure` CLI — *optional*, only for the build-from-source fallback (if a release jar isn't available).
 
 ## Install (bbin)
 
@@ -27,42 +19,21 @@ The jar runs standalone: `java -cp target/blast-radius.jar clojure.main -m blast
 bbin install https://raw.githubusercontent.com/fulcrologic/blast-radius/main/bin/blast-radius --as blast-radius
 ```
 
-This installs the launcher script (a `#!/usr/bin/env bb` file with no extra deps). On first run
-it resolves the engine; with nothing else configured it falls back to the public git coordinate
-(`io.github.fulcrologic/blast-radius`, pinned `:git/sha` in `bin/blast-radius`) via the clojure
-CLI. For the fastest **java-only** runtime, point it at a checkout so it builds + caches a jar:
+That's it — **no clone, no env vars, no config.** On first run the launcher downloads the engine
+jar from the GitHub Release into `~/.cache/blast-radius/<version>/` and caches it; every run after
+is plain `java`. If the release asset is unavailable it automatically falls back to cloning the
+repo at the release tag and building the jar (`clojure -T:build uber`).
+
+### Optional overrides (none required)
+
+- `$BLAST_RADIUS_JAR` — use this jar as-is (skip download/build).
+- `$BLAST_RADIUS_HOME` — build the engine from this local checkout (for development).
+- `$BLAST_RADIUS_JAR_URL` / `$BLAST_RADIUS_JAR_HEADER` — a custom/private asset URL + auth header.
+
+## Build the engine jar (maintainers)
 
 ```bash
-git clone https://github.com/fulcrologic/blast-radius
-export BLAST_RADIUS_HOME="$(pwd)/blast-radius"
-```
-
-For a fully zero-clojure-CLI install, attach the uberjar to a GitHub release and set
-`$BLAST_RADIUS_JAR_URL` to the asset URL (private registries: also set `$BLAST_RADIUS_JAR_HEADER`).
-
-The launcher resolves a JAVA-ONLY engine (no clojure CLI at runtime), building/caching the
-uberjar on demand so **nothing has to be published**. Resolution order (first match wins):
-
-1. `$BLAST_RADIUS_JAR` — an explicit jar path.
-2. `$BLAST_RADIUS_HOME` (a local checkout) — **builds the uberjar into the cache on first run,
-   and rebuilds only when `src`/`resources`/`deps.edn`/`build.clj` change** (`clojure -T:build
-   uber`; the clojure CLI is needed for this one-time build, not at runtime).
-3. `~/.cache/blast-radius/blast-radius.jar` — a previously built/downloaded jar.
-4. `$BLAST_RADIUS_JAR_URL` — downloaded to the cache on first run (point at a published release
-   asset for a zero-build, zero-clojure-CLI install).
-5. a pinned git coordinate via the clojure CLI — last resort (no jar; clojure CLI per run).
-
-So there is **no need to publish a jar**: with `BLAST_RADIUS_HOME` set to a checkout, the first
-run builds + caches it and every run after is plain `java` against the cached jar (auto-rebuilt
-on source change). Publishing (#4) is only worth it if you want users to skip even the one-time
-local build / clojure CLI entirely.
-
-```bash
-# No-publish, java-fast: point at a checkout; first run builds + caches the engine.
-export BLAST_RADIUS_HOME=/path/to/blast-radius
-
-# Or use a jar you built/obtained directly:
-export BLAST_RADIUS_JAR=/path/to/blast-radius.jar
+clojure -T:build uber        # -> target/blast-radius.jar (self-contained); attach to a GitHub Release
 ```
 
 ## Run (from the repo you want to analyze)

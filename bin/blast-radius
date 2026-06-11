@@ -1,90 +1,71 @@
 #!/usr/bin/env bb
-;; Blast Radius launcher — a tiny Babashka wrapper that execs a JVM with the right classpath.
-;; bb gives the easy bbin install + fast CLI startup; the JVM does the heavy build (native
-;; clj-kondo analysis + graph transforms), which is several-fold faster than sci.
+;; Blast Radius launcher. ZERO setup: `bbin install` this script, then run it.
 ;;
-;; ENGINE RESOLUTION (first match wins) — the goal is a JAVA-ONLY runtime (no clojure CLI),
-;; with the uberjar built/cached on demand so nothing has to be published:
-;;   1. $BLAST_RADIUS_JAR                         -> use that jar.
-;;   2. $BLAST_RADIUS_HOME (a local checkout)     -> BUILD-IF-STALE into the cache, then use it
-;;                                                   (`clojure -T:build uber`; one-time / on change).
-;;   3. ~/.cache/blast-radius/blast-radius.jar    -> a previously built/downloaded jar.
-;;   4. $BLAST_RADIUS_JAR_URL                      -> download to the cache (published release).
-;;   5. pinned git coordinate via the clojure CLI -> last-resort, no jar.
-;; Paths 1–4 run `java -cp <jar> clojure.main -m blast-radius.cli …` (no clojure CLI at runtime;
-;; building in path 2 needs the clojure CLI once). Path 5 needs the clojure CLI per run.
+;; On first run it fetches the engine — a self-contained JVM uberjar — and caches it under
+;; ~/.cache/blast-radius/<version>/; every run after is plain `java`. No env vars, no clone, no
+;; config required. The engine is resolved by the first of these that succeeds:
+;;   1. download the published GitHub Release jar   (default — needs only curl + java)
+;;   2. build from source: clone the repo at the release tag and `clojure -T:build uber`
+;;      (automatic fallback when the release asset is unavailable; needs the clojure CLI once)
+;; Optional overrides (none required): $BLAST_RADIUS_JAR (use this jar as-is),
+;; $BLAST_RADIUS_HOME (build from this local checkout), $BLAST_RADIUS_JAR_URL /
+;; $BLAST_RADIUS_JAR_HEADER (custom/private asset URL + auth header).
 ;;
-;; Usage (run from the repo to analyze; config in its .blast-radius.edn):
+;; Usage (run from the repo to analyze; optional .blast-radius.edn for project config):
 ;;   blast-radius "$(git merge-base origin/main HEAD)..HEAD"
 ;;   blast-radius <commit> [--out-file … --trust-keywords :db/id,:company/id …]
 
 (require '[babashka.fs :as fs]
          '[babashka.process :as process])
 
-(def ^:private cached-jar (fs/file (fs/xdg-cache-home) "blast-radius" "blast-radius.jar"))
+(def ^:private version "v0.1.0")
+(def ^:private repo-url "https://github.com/fulcrologic/blast-radius.git")
+(def ^:private release-jar-url
+  (str "https://github.com/fulcrologic/blast-radius/releases/download/" version "/blast-radius.jar"))
+(def ^:private cache-dir (fs/file (fs/xdg-cache-home) "blast-radius" version))
+(def ^:private jar (fs/file cache-dir "blast-radius.jar"))
 
-(defn- newer-than? [path t]
-  (and (fs/exists? path) (pos? (compare (fs/last-modified-time path) t))))
-
-(defn- stale?
-  "True when `jar` is missing or older than any source/deps/build file under checkout `home`."
-  [jar home]
-  (or (not (fs/exists? jar))
-      (let [t (fs/last-modified-time jar)]
-        (boolean
-         (or (some #(newer-than? (fs/file home %) t) ["deps.edn" "build.clj"])
-             (seq (filter #(pos? (compare (fs/last-modified-time %) t))
-                          (fs/glob home "{src,resources}/**"))))))))
-
-(defn- build-and-cache!
-  "Builds the uberjar from checkout `home` (`clojure -T:build uber`) and copies it into the
-   cache. Returns the cached jar path, or nil on failure (caller falls through)."
-  [home]
-  (binding [*out* *err*] (println "blast-radius: building engine jar (one-time / on change) …"))
-  (let [{:keys [exit]} (process/shell {:dir home :continue true :out :inherit :err :inherit}
-                                      "clojure" "-T:build" "uber")
-        built (fs/file home "target" "blast-radius.jar")]
-    (when (and (zero? exit) (fs/exists? built))
-      (fs/create-dirs (fs/parent cached-jar))
-      (fs/copy built cached-jar {:replace-existing true})
-      (str cached-jar))))
+(defn- log [& xs] (binding [*out* *err*] (apply println "blast-radius:" xs)))
 
 (defn- download!
-  "Downloads the engine jar from `url` to the cache. For a PRIVATE GitLab package registry, set
-   $BLAST_RADIUS_JAR_HEADER (e.g. \"PRIVATE-TOKEN: glpat-…\" or \"JOB-TOKEN: …\") — it is passed
-   as a curl header so the token is not baked into the URL."
+  "Downloads the engine jar from `url` into the cache. Honors $BLAST_RADIUS_JAR_HEADER (e.g.
+   \"PRIVATE-TOKEN: …\") for authenticated/private assets. True on success."
   [url]
-  (fs/create-dirs (fs/parent cached-jar))
-  (binding [*out* *err*] (println "blast-radius: downloading engine jar …"))
-  (let [header (System/getenv "BLAST_RADIUS_JAR_HEADER")
-        argv   (cond-> ["curl" "-fsSL" "-o" (str cached-jar)]
-                 header (conj "-H" header)
-                 true   (conj url))
-        {:keys [exit]} (apply process/shell {:continue true} argv)]
-    (when (zero? exit) (str cached-jar))))
+  (log "fetching engine" version "…")
+  (let [hdr  (System/getenv "BLAST_RADIUS_JAR_HEADER")
+        argv (cond-> ["curl" "-fsSL" "-o" (str jar)] hdr (conj "-H" hdr) :always (conj url))]
+    (and (zero? (:exit (apply process/shell {:continue true} argv))) (fs/exists? jar))))
 
-(defn- resolve-jar []
-  (let [explicit (System/getenv "BLAST_RADIUS_JAR")
-        home     (System/getenv "BLAST_RADIUS_HOME")
-        url      (System/getenv "BLAST_RADIUS_JAR_URL")]
-    (cond
-      (and explicit (fs/exists? explicit)) explicit
-      (and home (fs/exists? (fs/file home "build.clj")))
-      (if (stale? cached-jar home) (build-and-cache! home) (str cached-jar))
-      (fs/exists? cached-jar) (str cached-jar)
-      url                     (download! url)
-      :else                   nil)))
+(defn- build-from!
+  "Builds the uberjar from checkout `src` (`clojure -T:build uber`) and caches it. True on success."
+  [src]
+  (log "building engine from" (str src) "…")
+  (process/shell {:dir (str src) :continue true :out :inherit :err :inherit} "clojure" "-T:build" "uber")
+  (let [built (fs/file src "target" "blast-radius.jar")]
+    (when (fs/exists? built) (fs/copy built jar {:replace-existing true}) (fs/exists? jar))))
 
-(defn- command []
-  (let [args (vec *command-line-args*)]
-    (if-let [jar (resolve-jar)]
-      (into ["java" "-cp" jar "clojure.main" "-m" "blast-radius.cli"] args)
-      (let [home  (System/getenv "BLAST_RADIUS_HOME")
-            sdeps (if home
-                    (format "{:deps {io.github.fulcrologic/blast-radius {:local/root \"%s\"}}}" home)
-                    ;; Public GitHub repo — resolved over HTTPS, no creds needed.
-                    "{:deps {io.github.fulcrologic/blast-radius {:git/sha \"9c46246844b6fda97f35259d668156ae13ca23c8\"}}}")]
-        (into ["clojure" "-Sdeps" sdeps "-M" "-m" "blast-radius.cli"] args)))))
+(defn- clone-and-build!
+  "Clones the repo at the release tag into the cache and builds the engine. True on success."
+  []
+  (let [src (fs/file cache-dir "repo")]
+    (when-not (fs/exists? src)
+      (log "cloning" repo-url "at" version "…")
+      (process/shell {:continue true} "git" "clone" "--quiet" "--branch" version "--depth" "1"
+                     repo-url (str src)))
+    (and (fs/exists? src) (build-from! src))))
 
+(defn- ensure-jar! []
+  (fs/create-dirs cache-dir)
+  (when-not (fs/exists? jar)
+    (or (when-let [j (System/getenv "BLAST_RADIUS_JAR")] (when (fs/exists? j) (fs/copy j jar) true))
+        (when-let [h (System/getenv "BLAST_RADIUS_HOME")] (build-from! h))
+        (download! (or (System/getenv "BLAST_RADIUS_JAR_URL") release-jar-url))
+        (clone-and-build!)))
+  (when-not (fs/exists? jar)
+    (log "could not obtain the engine (need curl+java to download, or git+clojure to build).")
+    (System/exit 1)))
+
+(ensure-jar!)
 ;; exec replaces this bb process with the JVM, forwarding stdout/stderr and the exit code.
-(process/exec (command))
+(process/exec (into ["java" "-cp" (str jar) "clojure.main" "-m" "blast-radius.cli"]
+                    (vec *command-line-args*)))

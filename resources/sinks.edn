@@ -1,0 +1,48 @@
+;; Example I/O sink registry (design §13). KEYS ARE FULLY-QUALIFIED SYMBOLS — aliases are
+;; unstable; clj-kondo resolves each call site's namespace, so matching is on the resolved :to.
+;;
+;; This bundled file covers the UPSTREAM libraries (Datomic, next.jdbc, HTTP, SQS). Most real
+;; projects wrap these behind their own facade fns (e.g. `myapp.db/q`); register those WRAPPER
+;; symbols in a project sinks file and point `.blast-radius.edn :sinks-file` at it — an omitted
+;; I/O boundary is a silent recall hole (§13/§25).
+;;
+;;   :io          - #{:read :write} (or both) — the I/O DIRECTION
+;;   :source?     - the RETURN VALUE carries read data in a DETERMINATE, locally-defined
+;;                  qualified-keyword schema (Datomic, next.jdbc :table/column), so §21
+;;                  read-inference can recover the read-set. NOT for remote/stringly-typed
+;;                  results (HTTP/queue), and NEVER on an outbound write.
+;;   :pattern-arg - opaque pull/query pattern arg position (recall-frontier report only).
+{;; ── Datomic client (datomic.client.api) ──
+ datomic.client.api/transact    {:io #{:write}}
+ datomic.client.api/q           {:io #{:read} :source? true}
+ datomic.client.api/pull        {:io #{:read} :source? true :pattern-arg 1}
+ datomic.client.api/pull-many   {:io #{:read} :source? true :pattern-arg 1}
+ datomic.client.api/index-pull  {:io #{:read} :source? true :pattern-arg 1}
+ datomic.client.api/index-range {:io #{:read} :source? true}
+ datomic.client.api/datoms      {:io #{:read} :source? true}
+ datomic.client.api/with        {:io #{:write}}
+
+ ;; ── Datomic peer (datomic.api) ──
+ datomic.api/transact       {:io #{:write}}
+ datomic.api/transact-async {:io #{:write}}
+ datomic.api/q              {:io #{:read} :source? true}
+ datomic.api/pull           {:io #{:read} :source? true :pattern-arg 1}
+ datomic.api/datoms         {:io #{:read} :source? true}
+ datomic.api/index-range    {:io #{:read} :source? true}
+ datomic.api/entity         {:io #{:read} :source? true}
+
+ ;; ── JDBC (next.jdbc) ──
+ next.jdbc/execute!     {:io #{:read :write} :source? true}
+ next.jdbc/execute-one! {:io #{:read :write} :source? true}
+ next.jdbc/plan         {:io #{:read} :source? true}
+
+ ;; ── HTTP (httpkit / clj-http) — remote/server-defined shapes => NOT :source? ──
+ org.httpkit.client/request {:io #{:read :write}}
+ org.httpkit.client/get     {:io #{:read}}
+ org.httpkit.client/post    {:io #{:write}}
+ clj-http.client/get        {:io #{:read}}
+ clj-http.client/post       {:io #{:write}}
+
+ ;; ── Queue (SQS) — stringly-typed payloads => NOT :source? ──
+ amazonica.aws.sqs/send-message    {:io #{:write}}
+ amazonica.aws.sqs/receive-message {:io #{:read}}}

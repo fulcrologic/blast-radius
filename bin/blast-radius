@@ -29,12 +29,18 @@
 
 (defn- download!
   "Downloads the engine jar from `url` into the cache. Honors $BLAST_RADIUS_JAR_HEADER (e.g.
-   \"PRIVATE-TOKEN: …\") for authenticated/private assets. True on success."
+   \"PRIVATE-TOKEN: …\") for authenticated/private assets. Writes to a temp file and atomically
+   moves it into place only on a complete, sane (~10MB) download, so an interrupted fetch never
+   poisons the cache. True on success."
   [url]
   (log "fetching engine" version "…")
-  (let [hdr  (System/getenv "BLAST_RADIUS_JAR_HEADER")
-        argv (cond-> ["curl" "-fsSL" "-o" (str jar)] hdr (conj "-H" hdr) :always (conj url))]
-    (and (zero? (:exit (apply process/shell {:continue true} argv))) (fs/exists? jar))))
+  (let [tmp  (fs/file cache-dir "blast-radius.jar.part")
+        hdr  (System/getenv "BLAST_RADIUS_JAR_HEADER")
+        argv (cond-> ["curl" "-fsSL" "-o" (str tmp)] hdr (conj "-H" hdr) :always (conj url))
+        ok   (zero? (:exit (apply process/shell {:continue true} argv)))]
+    (if (and ok (fs/exists? tmp) (> (fs/size tmp) 1000000))
+      (do (fs/move tmp jar {:replace-existing true}) true)
+      (do (when (fs/exists? tmp) (fs/delete tmp)) false))))
 
 (defn- build-from!
   "Builds the uberjar from checkout `src` (`clojure -T:build uber`) and caches it. True on success."

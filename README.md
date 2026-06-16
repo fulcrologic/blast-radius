@@ -33,7 +33,7 @@ Requires `bb`, `java`, `clj-kondo`, and `git`. Install the launcher with
 [bbin](https://github.com/babashka/bbin):
 
 ```bash
-bbin install https://raw.githubusercontent.com/fulcrologic/blast-radius/main/bin/blast-radius --as blast-radius
+bbin install https://raw.githubusercontent.com/fulcrologic/blast-radius/main/bin/blast-radius.bb --as blast-radius
 ```
 
 That's it — **no clone, no env vars, no config.** On first run the launcher downloads the engine

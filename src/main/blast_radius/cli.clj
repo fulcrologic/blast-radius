@@ -19,8 +19,10 @@
    [blast-radius.io :as bio]
    [blast-radius.keyword-index :as ki]
    [blast-radius.plugins :as plugins]
+   [blast-radius.plugins.rad-resolvers :as rr]
    [clojure.edn :as edn]
    [clojure.java.io :as jio]
+   [clojure.java.shell :as shell]
    [clojure.pprint :as pprint]
    [clojure.string :as str]))
 
@@ -130,6 +132,19 @@
   (or (resolve-path repo-root sinks-file)
       (jio/resource "sinks.edn")))
 
+(defn- materialize-file
+  "Returns a temp-file path holding `repo-root`'s `rel` at git `ref` (via `git show`), or nil.
+   Lets the RAD plugin parse the file version that MATCHES the analyzed tree (ref-b), and the
+   prior version (ref-a) for diff-scoping — not whatever the working tree happens to be."
+  [repo-root ref rel]
+  (try
+    (let [{:keys [exit out]} (shell/sh "git" "-C" (str repo-root) "show" (str ref ":" rel))]
+      (when (and (zero? exit) (seq out))
+        (let [tmp (java.io.File/createTempFile "blast-radius-" ".cljc")]
+          (spit tmp out)
+          (.getPath tmp))))
+    (catch Throwable _ nil)))
+
 (defn- resolve-refs
   "Returns `[ref-a ref-b]` for the comparison. When a single `commit` is supplied it
    expands to `[\"<commit>^\" \"<commit>\"]`; otherwise `ref-a`/`ref-b` are used as-is."
@@ -148,15 +163,23 @@
    so the expensive clj-kondo pass runs once per distinct source tree.
 
    `:cached-analysis` (an explicit EDN path) still overrides — useful for tests/benchmarks and
-   for the common `ref-b == HEAD` case where a prebuilt cache already matches the tree."
+   for the common `ref-b == HEAD` case where a prebuilt cache already matches the tree.
+
+   Returns `{:normalized … :src-root dir}`. `:src-root` is the directory the pipeline must
+   re-read source from (forms by `{:filename :row}`, file slices): the MATERIALIZED ref-b tree
+   (so a historical commit's rows match its analysis), or `repo-root` when a `:cached-analysis`
+   is supplied (then re-reads come from the working tree)."
   [{:keys [repo-root cached-analysis ref-b cache-dir kondo-bin paths]}]
-  (let [raw (if (and cached-analysis (.exists (jio/file cached-analysis)))
-              (analysis/read-cached cached-analysis)
-              (analysis/analyze-ref repo-root ref-b (cond-> {}
-                                                      cache-dir (assoc :cache-dir cache-dir)
-                                                      kondo-bin (assoc :kondo-bin kondo-bin)
-                                                      paths     (assoc :paths paths))))]
-    (analysis/normalize raw)))
+  (if (and cached-analysis (.exists (jio/file cached-analysis)))
+    {:normalized (analysis/normalize (analysis/read-cached cached-analysis))
+     :src-root   repo-root}
+    {:normalized (analysis/normalize
+                  (analysis/analyze-ref repo-root ref-b (cond-> {}
+                                                          cache-dir (assoc :cache-dir cache-dir)
+                                                          kondo-bin (assoc :kondo-bin kondo-bin)
+                                                          paths     (assoc :paths paths))))
+     ;; ensure the ref-b tree exists (idempotent) and re-read source from it.
+     :src-root   (analysis/materialized-tree-dir repo-root ref-b {:paths (or paths ["src"])})}))
 
 (defn- declared->profiles
   "Adapts the T5 DECLARED profile map (`{sym {:outputs :source? :io :type :declares-keyword}}`)
@@ -244,11 +267,12 @@
         (merge default-opts (repo-config repo-root) opts {:repo-root repo-root})
         [ref-a ref-b] (resolve-refs opts)
         ;; (1) static analysis of the tree AT ref-b (faithful per-ref, cached by tree-sha;
-        ;;     an explicit :cached-analysis still overrides).
-        normalized      (load-analysis (assoc opts :ref-b ref-b))
+        ;;     an explicit :cached-analysis still overrides). `src-root` is where the pipeline
+        ;;     re-reads source (the materialized ref-b tree) so forms/rows match the analysis.
+        {:keys [normalized src-root]} (load-analysis (assoc opts :ref-b ref-b))
         ;; (2) call graph scoped to ns-prefixes, UNION synthetic CUD edges (§22.1, optional).
         base-graph      (cg/build-call-graph normalized {:ns-prefixes ns-prefixes})
-        synthetic       (plugins/synthetic-edges {:base-clj-path (resolve-path repo-root base-clj-path)})
+        synthetic       (plugins/synthetic-edges {:base-clj-path (resolve-path src-root base-clj-path)})
         call-graph      (reduce
                          (fn [g {:keys [from to]}]
                            (-> g
@@ -260,8 +284,8 @@
         kw-index        (ki/keyword-index (or (:analysis normalized) normalized))
         ;; (4) direct I/O profiles (T3) + declarative profiles (T5 plugins).
         sinks           (bio/read-sinks (sinks-source repo-root sinks-file))
-        io-profiles     (fast-symbol-io normalized sinks repo-root)
-        declared        (plugins/analyze-forms normalized {:src-root repo-root})
+        io-profiles     (fast-symbol-io normalized sinks src-root)
+        declared        (plugins/analyze-forms normalized {:src-root src-root})
         ;; (5) keyword dictionary (T1) — RAD universe widened with declared kws.
         declared-kws    (into #{} (keep :declares-keyword) (vals declared))
         dictionary      (dict/build-dictionary normalized kw-index
@@ -331,6 +355,41 @@
                                g)))
                          attribute-graph
                          gate-vars)
+        ;; (9.5) RAD minted-resolver plugin (§22.1/§28.5): synthesize the resolvers RAD mints for
+        ;; registered identity attrs so their outputs join Edge B, and surface competing-producer
+        ;; collisions. Enabled by `.blast-radius.edn :rad-resolvers {:model-file … :registry-def …}`.
+        var-loc         (into {} (map (fn [{:keys [sym filename row]}] [sym {:file filename :line row}]))
+                              (:vars normalized))
+        rad-cfg         (:rad-resolvers opts)
+        rad-registry-def (or (:registry-def rad-cfg) 'auto-resolved-attributes)
+        ;; parse model.cljc AT ref-b (matches the analyzed tree); fall back to working tree.
+        ;; parse the ref-b model.cljc from the materialized tree (src-root), matching the analysis.
+        rad-model-path  (when (:model-file rad-cfg) (resolve-path src-root (:model-file rad-cfg)))
+        rad-prior-syms  (when (:model-file rad-cfg)
+                          (some-> (materialize-file repo-root ref-a (:model-file rad-cfg))
+                                  (rr/parse-registry rad-registry-def)
+                                  :registry-symbols))
+        rad             (when (and (:model-file rad-cfg) (.exists (jio/file rad-model-path)))
+                          (rr/minted-resolvers
+                           {:declared declared
+                            :model-clj-path rad-model-path
+                            :model-rel (:model-file rad-cfg)
+                            :var-loc var-loc
+                            :registry-def rad-registry-def
+                            :prior-registry-symbols rad-prior-syms}))
+        ;; minted outputs become Edge-B producers sourced at the registry var, so changing the
+        ;; registry blasts to consumers of the minted keywords.
+        attribute-graph (if rad
+                          (reduce (fn [g k] (update-in g [k :producers] (fnil conj #{}) (:registry-sym rad)))
+                                  attribute-graph (:minted-keywords rad))
+                          attribute-graph)
+        effective       (if rad
+                          (update effective (:registry-sym rad)
+                                  (fn [p] (merge {:sym (:registry-sym rad) :file (:registry-file rad)} p
+                                                 {:source?          true
+                                                  :outputs          (into (set (:outputs p)) (:minted-keywords rad))
+                                                  :declared-outputs (into (set (:declared-outputs p)) (:minted-keywords rad))})))
+                          effective)
         ;; (10) blast radius generation (§23/§24/§25/§27).
         result          (blast/blast-radius {:changed         changed
                                              :call-graph      call-graph
@@ -342,15 +401,31 @@
                                              :fixes           (:fixes opts)
                                              :declarative-seeds declarative-seeds
                                              :gate-vars       gate-vars})
-        ;; Record the actual refs in the run metadata (audit/idempotence).
-        result          (assoc-in result [:run :refs-compared] [ref-a ref-b])
+        ;; Record the actual refs in the run metadata (audit/idempotence). RAD collisions are a
+        ;; TOP-LEVEL section (§28.5) — they sort above ordinary candidates.
+        result          (cond-> (assoc-in result [:run :refs-compared] [ref-a ref-b])
+                          rad (assoc :collisions (:collisions rad)))
         out             (jio/file out-file)
         frontier        (get-in result [:run :recall-frontier])
-        affected        (count (:candidates result))]
+        affected        (count (:candidates result))
+        collisions      (:collisions result)]
     (with-open [w (jio/writer out)]
       (binding [*out* w]
         (pprint/pprint result)))
     (println "Blast Radius:" ref-a ".." ref-b)
+    (when (seq collisions)
+      (let [intro (filterv :introduced? collisions)]
+        (println)
+        (println "⚠ RESOLVER COLLISIONS:" (count collisions) "minted output keyword(s) also produced by a hand-written resolver"
+                 (str "(" (count intro) " introduced by this change)"))
+        (run! (fn [{:keys [output-keyword introduced? producers]}]
+                (println (if introduced? "  »" "   ") output-keyword
+                         (str "— " (count producers) " producers:"))
+                (run! (fn [{:keys [kind file line sym]}]
+                        (println "        " (name kind) (str file ":" line) (str "(" sym ")")))
+                      producers))
+              (concat intro (remove :introduced? collisions)))
+        (println)))
     (println "Affected files:" affected
              (str "(named couplings " (get-in result [:run :named-count])
                   ", trust-list excluded " (get-in result [:run :trust-list-excluded]) ")"))

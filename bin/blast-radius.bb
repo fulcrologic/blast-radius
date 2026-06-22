@@ -18,7 +18,7 @@
 (require '[babashka.fs :as fs]
          '[babashka.process :as process])
 
-(def ^:private version "v0.1.0")
+(def ^:private version "v0.2.0")
 (def ^:private repo-url "https://github.com/fulcrologic/blast-radius.git")
 (def ^:private release-jar-url
   (str "https://github.com/fulcrologic/blast-radius/releases/download/" version "/blast-radius.jar"))

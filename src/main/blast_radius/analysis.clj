@@ -124,6 +124,29 @@
   (let [{:keys [exit out]} (shell/sh "git" "-C" (str repo-root) "rev-parse" (str ref "^{tree}"))]
     (when (zero? exit) (str/trim out))))
 
+(defn materialized-tree-dir
+  "Materializes `repo-root`'s `:paths` at git `ref` read-only into a temp dir (`git archive | tar`,
+   no working-copy touch) and copies the project's `.clj-kondo` config (sans `.cache`) in, so the
+   tree clj-kondo lints AND the source the pipeline re-reads (forms by `{:filename :row}`) are the
+   EXACT ref-b source — rows match the analysis. Returns the temp dir path (idempotent: keyed by
+   tree-sha). Use it as the `:src-root` for `analyze-forms`/IO so a HISTORICAL commit's forms are
+   read from that commit, not whatever the working tree happens to be."
+  [repo-root ref {:keys [paths] :or {paths ["src"]}}]
+  (let [sha (tree-sha repo-root ref)
+        tmp (str (System/getProperty "java.io.tmpdir") "/blast-radius-tree-" sha)]
+    (io/make-parents (io/file tmp "x"))
+    (doseq [p paths]
+      (let [cmd (format "git -C %s archive %s -- %s | tar -x -C %s" repo-root ref p tmp)
+            {:keys [exit err]} (shell/sh "bash" "-c" cmd)]
+        (when-not (zero? exit)
+          (throw (ex-info "git archive | tar failed" {:ref ref :path p :err err})))))
+    (let [kondo-cfg (io/file repo-root ".clj-kondo")]
+      (when (.exists kondo-cfg)
+        (shell/sh "bash" "-c"
+                  (format "rm -rf '%s/.clj-kondo' && cp -R '%s' '%s/.clj-kondo' && rm -rf '%s/.clj-kondo/.cache'"
+                          tmp (.getPath kondo-cfg) tmp tmp))))
+    tmp))
+
 (defn analyze-ref
   "Returns the clj-kondo analysis map for `repo-root` at git `ref`, analyzing the ACTUAL
    tree at that ref (faithful per-ref, fixing the HEAD-cache soundness gap) and CACHING the
@@ -150,19 +173,14 @@
         cfile (io/file cdir (str "analysis-" sha ".edn"))]
     (if (and sha (.exists cfile))
       (read-cached (.getPath cfile))
-      (let [tmp (str (System/getProperty "java.io.tmpdir") "/blast-radius-tree-" sha)]
-        (io/make-parents (io/file tmp "x"))
-        (doseq [p paths]
-          (let [cmd (format "git -C %s archive %s -- %s | tar -x -C %s" repo-root ref p tmp)
-                {:keys [exit err]} (shell/sh "bash" "-c" cmd)]
-            (when-not (zero? exit)
-              (throw (ex-info "git archive | tar failed" {:ref ref :path p :err err})))))
+      (let [tmp (materialized-tree-dir repo-root ref {:paths paths})]
         (io/make-parents (.getPath cfile))
         ;; Native clj-kondo: its `:format :edn` output is itself `{:analysis … :findings …}`,
-        ;; which `read-cached` (`(:analysis …)`) consumes directly. Stream stdout to the cache.
-        (let [lint-paths (str/join " " (map #(str tmp "/" %) paths))
-              cmd (format "%s --lint %s --config '{:output {:analysis {:keywords true} :format :edn}}' > %s"
-                          kondo-bin lint-paths (.getPath cfile))
+        ;; which `read-cached` (`(:analysis …)`) consumes directly. Run with cwd = the tree so
+        ;; clj-kondo finds the copied `.clj-kondo` and emits repo-relative `:filename`s.
+        (let [lint-paths (str/join " " paths)
+              cmd (format "cd '%s' && %s --lint %s --config '{:output {:analysis {:keywords true} :format :edn}}' > '%s'"
+                          tmp kondo-bin lint-paths (.getPath cfile))
               {:keys [exit err]} (shell/sh "bash" "-c" cmd)]
           ;; clj-kondo exits non-zero (2/3) when it finds lint warnings — that is NOT a failure
           ;; for our analysis use; only a missing/!=0-with-empty-output is.

@@ -144,18 +144,36 @@
 
 ;; --- built-in methods ------------------------------------------------------
 
+(defn eql->top-keys
+  "Returns the TOP-LEVEL property/join keys of EQL `eql-vec` (not recursed): the keywords a
+   resolver DIRECTLY resolves. `[:a {:b [:c]} (:e {})]` → `[:a :b :e]`. Distinct from
+   `eql->keywords` (which flattens nested sub-queries): a resolver outputting `{:b [:c]}`
+   resolves `:b`, not `:c` (`:c` is resolved on the nested entity by other resolvers)."
+  [eql-vec]
+  (into []
+        (mapcat (fn [x]
+                  (cond
+                    (keyword? x) [x]
+                    (map? x)     (keys x)
+                    (seq? x)     (when (keyword? (first x)) [(first x)])
+                    :else        nil)))
+        eql-vec))
+
 (defn- resolver-profile
   "Returns the declared I/O profile of a Pathom resolver `form` (§22): inputs from
-   `::pco/input`/`::pc/input`, outputs = flattened `::pco/output`/`::pc/output` EQL. A
-   resolver produces its outputs, so it is a data `:source?` and reads to satisfy them."
+   `::pco/input`/`::pc/input`, outputs = flattened `::pco/output`/`::pc/output` EQL, and
+   `:output-keys` = the TOP-LEVEL output keys the resolver directly resolves (for collision
+   detection). A resolver produces its outputs, so it is a data `:source?` and reads them."
   [form sym]
-  (let [m (config-map form)]
-    {:sym     sym
-     :inputs  (set (pco-key m "input"))
-     :outputs (eql->keywords (or (pco-key m "output") []))
-     :source? true
-     :io      {:read? true :write? false}
-     :provenance :declared}))
+  (let [m   (config-map form)
+        eql (or (pco-key m "output") [])]
+    {:sym         sym
+     :inputs      (set (pco-key m "input"))
+     :outputs     (eql->keywords eql)
+     :output-keys (set (eql->top-keys eql))
+     :source?     true
+     :io          {:read? true :write? false}
+     :provenance  :declared}))
 
 (defn- mutation-profile
   "Returns the declared I/O profile of a Fulcro/Pathom mutation `form` (§22): inputs from the
@@ -175,7 +193,9 @@
 (defn- defattr-profile
   "Returns the dictionary-seed profile of a RAD `defattr` form (§22 / §28.5):
    `(defattr <sym> <k> <type> <options?>)`. `:declares-keyword` is the attribute keyword,
-   `:ref-target` / `:identities` / `:type` come from the options map (ns-insensitive keys)."
+   `:ref-target` / `:identities` / `:identity?` / `:type` come from the options map
+   (ns-insensitive keys). `:identity?` (RAD `ao/identity?`) marks the entity's identity
+   attribute — the one RAD mints an auto id-resolver for (§28.5 / RAD resolver-minting)."
   [form sym]
   (let [[_ _attr-sym k type] form
         opts (config-map form)]
@@ -183,6 +203,8 @@
      :declares-keyword k
      :ref-target       (pco-key opts "target")
      :identities       (pco-key opts "identities")
+     :identity?        (boolean (pco-key opts "identity?"))
+     :schema           (pco-key opts "schema")
      :type             type
      :provenance       :declared}))
 
